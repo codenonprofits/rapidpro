@@ -472,6 +472,11 @@ app.factory 'Flow', ['$rootScope', '$window', '$http', '$timeout', '$interval', 
           { name: 'Failure', test: { type: 'airtime_status', exit_status: 'failed'}},
         ]},
 
+        { type: 'shorten_url', name:'Shorten Trackable Link', verbose_name: 'Shorten Trackable Link', split:'shorten_url response', filter:[TEXT], rules:[
+          { name: 'Success', test: { type: 'webhook_status', status: 'success'}},
+          { name: 'Failure', test: { type: 'webhook_status', status: 'failure'}},
+        ]},
+
         # all flows
         { type: 'subflow', name: 'Run Flow', verbose_name: 'Run a flow', filter: ALL, rules: [
           { name: 'Completed', test: { type: 'subflow', exit_type: 'completed' }},
@@ -493,7 +498,7 @@ app.factory 'Flow', ['$rootScope', '$window', '$http', '$timeout', '$interval', 
       @exclusiveRules = {
         'subflow': ['subflow'],
         'timeout': ['wait_message'],
-        'webhook_status': ['webhook', 'resthook'],
+        'webhook_status': ['webhook', 'resthook', 'shorten_url'],
         'airtime_status': ['airtime'],
         'in_group': ['group']
       }
@@ -935,7 +940,6 @@ app.factory 'Flow', ['$rootScope', '$window', '$http', '$timeout', '$interval', 
     # Updates a single source to a given target. Expects a source id and a target id.
     # Source can be a rule or an actionset id.
     updateDestination: (source, target) ->
-
       source = source.split('_')
 
       sourceNode = Flow.getNode(source[0])
@@ -1020,7 +1024,8 @@ app.factory 'Flow', ['$rootScope', '$window', '$http', '$timeout', '$interval', 
         # add uuids for the individual actions, need this for the UI
         for actionset in flow.action_sets
           for action in actionset.actions
-            action.uuid = uuid()
+            if not action.uuid
+              action.uuid = uuid()
 
         # save the channel countries
         Flow.channel_countries = data.channel_countries
@@ -1190,7 +1195,7 @@ app.factory 'Flow', ['$rootScope', '$window', '$http', '$timeout', '$interval', 
     removeConnection: (connection) ->
       @updateDestination(connection.sourceId, null)
 
-    removeRuleset: (ruleset) ->
+    removeRuleset: (uuid) ->
 
       DragHelper.hide()
 
@@ -1201,13 +1206,13 @@ app.factory 'Flow', ['$rootScope', '$window', '$http', '$timeout', '$interval', 
       $timeout ->
 
         # update our model to nullify rules that point to us
-        connections = Plumb.getConnectionMap({ target: ruleset.uuid })
+        connections = Plumb.getConnectionMap({ target: uuid })
         for source of connections
           Flow.updateDestination(source, null)
 
         # then remove us
         for rs, idx in flow.rule_sets
-          if rs.uuid == ruleset.uuid
+          if rs.uuid == uuid
             flow.rule_sets.splice(idx, 1)
             break
       ,0

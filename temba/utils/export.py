@@ -15,9 +15,10 @@ from openpyxl import Workbook
 from openpyxl.utils.cell import get_column_letter
 from openpyxl.writer.write_only import WriteOnlyCell
 from temba.assets.models import BaseAssetStore, get_asset_store
-from . import clean_string, analytics
+from . import analytics
 from .models import TembaModel
 from .email import send_template_email
+from .text import clean_string
 
 
 class BaseExportAssetStore(BaseAssetStore):
@@ -121,7 +122,7 @@ class BaseExportTask(TembaModel):
         elif isinstance(value, datetime):
             return value.astimezone(self.org.timezone).replace(microsecond=0, tzinfo=None)
         else:
-            return six.text_type(value)
+            return clean_string(six.text_type(value))
 
     def set_sheet_column_widths(self, sheet, widths):
         for index, width in enumerate(widths):
@@ -145,11 +146,14 @@ class TableExporter(object):
     When writing to an Excel sheet, this also takes care of creating different sheets every 1048576
     rows, as again, Excel file only support that many per sheet.
     """
-    def __init__(self, task, sheet_name, columns):
+    def __init__(self, task, sheet_name, columns, is_csv=False):
         self.task = task
         self.columns = columns
-        self.is_csv = len(self.columns) > BaseExportTask.MAX_EXCEL_COLS
         self.sheet_name = sheet_name
+        if is_csv:
+            self.is_csv = True
+        else:
+            self.is_csv = len(self.columns) > BaseExportTask.MAX_EXCEL_COLS
 
         self.current_sheet = 0
         self.current_row = 0
@@ -197,8 +201,10 @@ class TableExporter(object):
         """
         Saves our data to a file, returning the file saved to and the extension
         """
-        # have to flush the XLS file
+        gc.collect()  # force garbage collection
+
         if not self.is_csv:
+            print("Writing Excel workbook...")
             self.workbook.save(self.file)
 
         self.file.flush()

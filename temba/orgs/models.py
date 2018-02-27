@@ -37,12 +37,12 @@ from requests import Session
 from smartmin.models import SmartModel
 from temba.bundles import get_brand_bundles, get_bundle_map
 from temba.locations.models import AdminBoundary, BoundaryAlias
-from temba.utils import analytics, str_to_datetime, get_datetime_format, datetime_to_str, random_string, languages
+from temba.utils import analytics, str_to_datetime, get_datetime_format, datetime_to_str, languages
 from temba.utils.cache import get_cacheable_result, get_cacheable_attr, incrby_existing
 from temba.utils.currencies import currency_for_country
 from temba.utils.email import send_template_email, send_simple_email, send_custom_smtp_email
 from temba.utils.models import SquashableModel
-from temba.utils.timezones import timezone_to_country_code
+from temba.utils.text import random_string
 from timezone_field import TimeZoneField
 from urlparse import urlparse
 from uuid import uuid4
@@ -51,8 +51,14 @@ from uuid import uuid4
 UNREAD_INBOX_MSGS = 'unread_inbox_msgs'
 UNREAD_FLOW_MSGS = 'unread_flow_msgs'
 
-CURRENT_EXPORT_VERSION = 10
-EARLIEST_IMPORT_VERSION = 3
+EARLIEST_IMPORT_VERSION = "3"
+
+
+# making this a function allows it to be used as a default for Django fields
+def get_current_export_version():
+    from temba.flows.models import Flow
+    return Flow.VERSIONS[-1]
+
 
 MT_SMS_EVENTS = 1 << 0
 MO_SMS_EVENTS = 1 << 1
@@ -107,6 +113,13 @@ SMTP_USERNAME = 'SMTP_USERNAME'
 SMTP_PASSWORD = 'SMTP_PASSWORD'
 SMTP_PORT = 'SMTP_PORT'
 SMTP_ENCRYPTION = 'SMTP_ENCRYPTION'
+
+CHATBASE_AGENT_NAME = 'CHATBASE_AGENT_NAME'
+CHATBASE_API_KEY = 'CHATBASE_API_KEY'
+CHATBASE_TYPE_AGENT = 'agent'
+CHATBASE_TYPE_USER = 'user'
+CHATBASE_FEEDBACK = 'CHATBASE_FEEDBACK'
+CHATBASE_VERSION = 'CHATBASE_VERSION'
 
 ORG_STATUS = 'STATUS'
 SUSPENDED = 'suspended'
@@ -277,6 +290,9 @@ class Org(SmartModel):
         from temba.middleware import BrandingMiddleware
         return BrandingMiddleware.get_branding_for_host(self.brand)
 
+    def get_brand_domain(self):
+        return self.get_branding()['domain']
+
     def lock_on(self, lock, qualifier=None):
         """
         Creates the requested type of org-level lock
@@ -321,11 +337,16 @@ class Org(SmartModel):
             r = get_redis_connection()
 
             active_topup_keys = [ORG_ACTIVE_TOPUP_REMAINING % (self.pk, topup.pk) for topup in self.topups.all()]
+
+            key_counter = 0
+            for key in active_topup_keys:
+                r.delete(key)
+                key_counter += 1
+
             return r.delete(ORG_CREDITS_TOTAL_CACHE_KEY % self.pk,
                             ORG_CREDITS_USED_CACHE_KEY % self.pk,
                             ORG_CREDITS_PURCHASED_CACHE_KEY % self.pk,
-                            ORG_ACTIVE_TOPUP_KEY % self.pk,
-                            **active_topup_keys)
+                            ORG_ACTIVE_TOPUP_KEY % self.pk) + key_counter
         else:
             return 0  # pragma: needs cover
 
@@ -366,11 +387,10 @@ class Org(SmartModel):
 
         # see if our export needs to be updated
         export_version = data.get('version', 0)
-        from temba.orgs.models import EARLIEST_IMPORT_VERSION, CURRENT_EXPORT_VERSION
-        if export_version < EARLIEST_IMPORT_VERSION:  # pragma: needs cover
+        if Flow.is_before_version(export_version, EARLIEST_IMPORT_VERSION):  # pragma: needs cover
             raise ValueError(_("Unknown version (%s)" % data.get('version', 0)))
 
-        if export_version < CURRENT_EXPORT_VERSION:
+        if Flow.is_before_version(export_version, get_current_export_version()):
             from temba.flows.models import FlowRevision
             data = FlowRevision.migrate_export(self, data, same_site, export_version)
 
@@ -385,10 +405,12 @@ class Org(SmartModel):
         from temba.campaigns.models import Campaign
         from temba.flows.models import Flow
         from temba.triggers.models import Trigger
+        from temba.links.models import Link
 
         exported_flows = []
         exported_campaigns = []
         exported_triggers = []
+        exported_links = []
 
         for component in components:
             if isinstance(component, Flow):
@@ -398,16 +420,22 @@ class Org(SmartModel):
                 exported_campaigns.append(component.as_json())
             elif isinstance(component, Trigger):
                 exported_triggers.append(component.as_json())
+            elif isinstance(component, Link):
+                exported_links.append(component.as_json())
 
-        return dict(version=CURRENT_EXPORT_VERSION,
+        return dict(version=get_current_export_version(),
                     site=site_link,
                     flows=exported_flows,
                     campaigns=exported_campaigns,
-                    triggers=exported_triggers)
+                    triggers=exported_triggers,
+                    links=exported_links)
 
     def config_json(self):
         if self.config:
-            return json.loads(self.config)
+            try:
+                return json.loads(self.config)
+            except Exception:
+                return dict()
         else:
             return dict()
 
@@ -436,7 +464,7 @@ class Org(SmartModel):
         channels = self.channels.filter(is_active=True, role__contains=role).order_by('-pk')
 
         if scheme is not None:
-            channels = channels.filter(scheme=scheme)
+            channels = channels.filter(schemes__contains=[scheme])
 
         channel = None
         if country_code:
@@ -487,7 +515,7 @@ class Org(SmartModel):
 
                 # no country specific channel, try to find any channel at all
                 if not channels:
-                    channels = [c for c in self.channels.all()]
+                    channels = [c for c in self.channels.filter(schemes__contains=[TEL_SCHEME])]
 
                 # filter based on role and activity (we do this in python as channels can be prefetched so it is quicker in those cases)
                 senders = []
@@ -499,14 +527,18 @@ class Org(SmartModel):
                 # if we have more than one match, find the one with the highest overlap
                 if len(senders) > 1:
                     for sender in senders:
-                        channel_number = sender.address.strip('+')
+                        config = sender.config_json()
+                        channel_prefixes = config.get(Channel.CONFIG_SHORTCODE_MATCHING_PREFIXES, [])
+                        if not channel_prefixes or not isinstance(channel_prefixes, list):
+                            channel_prefixes = [sender.address.strip('+')]
 
-                        for idx in range(prefix, len(channel_number)):
-                            if idx >= prefix and channel_number[0:idx] == contact_number[0:idx]:
-                                prefix = idx
-                                channel = sender
-                            else:
-                                break
+                        for chan_prefix in channel_prefixes:
+                            for idx in range(prefix, len(chan_prefix)):
+                                if idx >= prefix and chan_prefix[0:idx] == contact_number[0:idx]:
+                                    prefix = idx
+                                    channel = sender
+                                else:
+                                    break
                 elif senders:
                     channel = senders[0]
 
@@ -543,8 +575,8 @@ class Org(SmartModel):
         return self.get_channel_for_role(Channel.ROLE_ANSWER, scheme=TEL_SCHEME, contact_urn=contact_urn, country_code=country_code)
 
     def get_ussd_channels(self):
-        from temba.channels.models import Channel
-        return self.channels.filter(is_active=True, org=self, channel_type__in=Channel.USSD_CHANNELS)
+        from temba.channels.models import ChannelType, Channel
+        return Channel.get_by_category(self, ChannelType.Category.USSD)
 
     def get_channel_delegate(self, channel, role):
         """
@@ -568,7 +600,8 @@ class Org(SmartModel):
 
         schemes = set()
         for channel in self.channels.filter(is_active=True, role__contains=role):
-            schemes.add(channel.scheme)
+            for scheme in channel.schemes:
+                schemes.add(scheme)
 
         setattr(self, cache_attr, schemes)
         return schemes
@@ -596,7 +629,10 @@ class Org(SmartModel):
         """
         Returns a string with webhook url.
         """
-        return json.loads(self.webhook).get('url') if self.webhook else None
+        try:
+            return json.loads(self.webhook).get('url') if self.webhook else None
+        except Exception:
+            return None
 
     def get_webhook_headers(self):
         """
@@ -604,7 +640,10 @@ class Org(SmartModel):
         {'Authorization': 'Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==',
          'X-My-Special-Header': 'woo'}
         """
-        return json.loads(self.webhook).get('headers', dict()) if self.webhook else dict()
+        try:
+            return json.loads(self.webhook).get('headers', dict()) if self.webhook else dict()
+        except Exception:
+            return dict()
 
     def get_channel_countries(self):
         channel_countries = []
@@ -770,13 +809,13 @@ class Org(SmartModel):
         nexmo_uuid = str(uuid4())
         nexmo_config = {NEXMO_KEY: api_key.strip(), NEXMO_SECRET: api_secret.strip(), NEXMO_UUID: nexmo_uuid}
         client = NexmoClient(key=nexmo_config[NEXMO_KEY], secret=nexmo_config[NEXMO_SECRET])
-        temba_host = settings.TEMBA_HOST.lower()
+        domain = self.get_brand_domain()
 
-        app_name = "%s/%s" % (temba_host, nexmo_uuid)
+        app_name = "%s/%s" % (domain, nexmo_uuid)
 
-        answer_url = "https://%s%s" % (temba_host, reverse('handlers.nexmo_call_handler', args=['answer', nexmo_uuid]))
+        answer_url = "https://%s%s" % (domain, reverse('handlers.nexmo_call_handler', args=['answer', nexmo_uuid]))
 
-        event_url = "https://%s%s" % (temba_host, reverse('handlers.nexmo_call_handler', args=['event', nexmo_uuid]))
+        event_url = "https://%s%s" % (domain, reverse('handlers.nexmo_call_handler', args=['event', nexmo_uuid]))
 
         params = dict(name=app_name, type='voice', answer_url=answer_url, answer_method='POST',
                       event_url=event_url, event_method='POST')
@@ -836,8 +875,7 @@ class Org(SmartModel):
     def remove_nexmo_account(self, user):
         if self.config:
             # release any nexmo channels
-            from temba.channels.models import Channel
-            for channel in self.channels.filter(is_active=True, channel_type=Channel.TYPE_NEXMO):  # pragma: needs cover
+            for channel in self.channels.filter(is_active=True, channel_type='NX'):  # pragma: needs cover
                 channel.release()
 
             config = self.config_json()
@@ -852,9 +890,8 @@ class Org(SmartModel):
 
     def remove_twilio_account(self, user):
         if self.config:
-            # release any twilio channels
-            from temba.channels.models import Channel
-            for channel in self.channels.filter(is_active=True, channel_type=Channel.TYPE_TWILIO):
+            # release any twilio and twilio messaging sevice channels
+            for channel in self.channels.filter(is_active=True, channel_type__in=['T', 'TMS']):
                 channel.release()
 
             config = self.config_json()
@@ -867,6 +904,44 @@ class Org(SmartModel):
 
             # clear all our channel configurations
             self.clear_channel_caches()
+
+    def connect_chatbase(self, agent_name, api_key, version, user):
+        chatbase_config = {
+            CHATBASE_AGENT_NAME: agent_name,
+            CHATBASE_API_KEY: api_key,
+            CHATBASE_VERSION: version
+        }
+
+        config = self.config_json()
+        config.update(chatbase_config)
+        self.config = json.dumps(config)
+        self.modified_by = user
+        self.save()
+
+    def remove_chatbase_account(self, user):
+        config = self.config_json()
+
+        if CHATBASE_AGENT_NAME in config:
+            del config[CHATBASE_AGENT_NAME]
+
+        if CHATBASE_API_KEY in config:
+            del config[CHATBASE_API_KEY]
+
+        if CHATBASE_VERSION in config:
+            del config[CHATBASE_VERSION]
+
+        self.config = json.dumps(config)
+        self.modified_by = user
+        self.save()
+
+    def get_chatbase_credentials(self):
+        if self.config:
+            config = self.config_json()
+            chatbase_api_key = config.get(CHATBASE_API_KEY, None)
+            chatbase_version = config.get(CHATBASE_VERSION, None)
+            return chatbase_api_key, chatbase_version
+        else:
+            return None, None
 
     def get_verboice_client(self):  # pragma: needs cover
         from temba.ivr.clients import VerboiceClient
@@ -1126,12 +1201,10 @@ class Org(SmartModel):
         return getattr(user, '_org_group', None)
 
     def has_twilio_number(self):  # pragma: needs cover
-        from temba.channels.models import Channel
-        return self.channels.filter(channel_type=Channel.TYPE_TWILIO)
+        return self.channels.filter(channel_type='T')
 
     def has_nexmo_number(self):  # pragma: needs cover
-        from temba.channels.models import Channel
-        return self.channels.filter(channel_type=Channel.TYPE_NEXMO)
+        return self.channels.filter(channel_type='NX')
 
     def create_welcome_topup(self, topup_size=None):
         if topup_size:
@@ -1334,6 +1407,9 @@ class Org(SmartModel):
                     self._calculate_credit_caches()
                     org._calculate_credit_caches()
 
+                    # apply topups to messages missing them
+                    org.apply_topups()
+
                 return True
 
         # couldn't allocate credits
@@ -1359,7 +1435,7 @@ class Org(SmartModel):
             remaining = r.decr(remaining_key, amount)
 
             # near the edge? calculate our active topup from scratch
-            if not remaining or int(remaining) < 100:
+            if not remaining or int(remaining) < 5000:
                 active_topup_pk = None
 
         # calculate our active topup if we need to
@@ -1488,9 +1564,9 @@ class Org(SmartModel):
         # for our purposes, #1 and #2 are treated the same, we just always update the default card
 
         try:
-            if not customer:
+            if not customer or customer.email != user.email:
                 # then go create a customer object for this user
-                customer = stripe.Customer.create(card=token, email=user,
+                customer = stripe.Customer.create(card=token, email=user.email,
                                                   description="{ org: %d }" % self.pk)
 
                 stripe_customer = customer.id
@@ -1506,7 +1582,10 @@ class Org(SmartModel):
                 for card in existing_cards:
                     card.delete()
 
-                card = customer.cards.create(card=token)
+                try:
+                    card = customer.cards.create(card=token)
+                except stripe.CardError:
+                    raise ValidationError(_("Sorry, your card was declined, please contact your provider or try another card."))
 
                 customer.default_card = card.id
                 customer.save()
@@ -1560,8 +1639,12 @@ class Org(SmartModel):
 
             return topup
 
+        except ValidationError as e:
+            raise e
+
         except Exception as e:
-            traceback.print_exc(e)
+            logger = logging.getLogger(__name__)
+            logger.error("Error adding credits to org", exc_info=True)
             raise ValidationError(_("Sorry, we were unable to process your payment, please try again later or contact us."))
 
     def account_value(self):
@@ -1731,40 +1814,6 @@ class Org(SmartModel):
 
         return all_components
 
-    def get_recommended_channel(self):
-        from temba.channels.views import TWILIO_SEARCH_COUNTRIES
-        NEXMO_RECOMMEND_COUNTRIES = ['US', 'CA', 'GB', 'AU', 'AT', 'FI', 'DE', 'HK', 'HU',
-                                     'LT', 'NL', 'NO', 'PL', 'SE', 'CH', 'BE', 'ES', 'ZA']
-
-        countrycode = timezone_to_country_code(self.timezone)
-        recommended = 'android'
-
-        if countrycode in [country[0] for country in TWILIO_SEARCH_COUNTRIES]:
-            recommended = 'twilio'
-
-        elif countrycode in NEXMO_RECOMMEND_COUNTRIES:
-            recommended = 'nexmo'
-
-        elif countrycode == 'KE':
-            recommended = 'africastalking'
-
-        elif countrycode == 'ID':
-            recommended = 'hub9'
-
-        elif countrycode == 'SO':
-            recommended = 'shaqodoon'
-
-        elif countrycode == 'NP':  # pragma: needs cover
-            recommended = 'blackmyna'
-
-        elif countrycode == 'UG':  # pragma: needs cover
-            recommended = 'yo'
-
-        elif countrycode == 'PH':  # pragma: needs cover
-            recommended = 'globe'
-
-        return recommended
-
     def increment_unread_msg_count(self, type):
         """
         Increments our redis cache of how many unread messages exist for this org and type.
@@ -1902,14 +1951,17 @@ class Org(SmartModel):
 # ===================== monkey patch User class with a few extra functions ========================
 
 def get_user_orgs(user, brand=None):
-    org = user.get_org()
     if not brand:
+        org = Org.get_org(user)
         brand = org.brand if org else settings.DEFAULT_BRAND
 
     if user.is_superuser:
         return Org.objects.all()
+
     user_orgs = user.org_admins.all() | user.org_editors.all() | user.org_viewers.all() | user.org_surveyors.all()
-    return user_orgs.filter(brand=brand).distinct().order_by('name')
+    all_orgs_ids = [item.id for item in user_orgs.filter(brand=brand, is_active=True).distinct().order_by('name')
+                    if not item.is_suspended()]
+    return Org.objects.filter(id__in=all_orgs_ids)
 
 
 def get_org(obj):

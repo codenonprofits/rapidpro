@@ -24,7 +24,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.generic import FormView
 from functools import cmp_to_key
 from itertools import chain
-from smartmin.views import SmartCRUDL, SmartCreateView, SmartReadView, SmartListView, SmartUpdateView
+from smartmin.views import SmartCRUDL, SmartCreateView, SmartReadView, SmartListView, SmartUpdateView, smart_url
 from smartmin.views import SmartDeleteView, SmartTemplateView, SmartFormView
 from temba.channels.models import Channel
 from temba.contacts.fields import OmniboxField
@@ -38,7 +38,7 @@ from temba.flows.tasks import export_flow_results_task
 from temba.locations.models import AdminBoundary
 from temba.msgs.models import Msg, PENDING
 from temba.triggers.models import Trigger
-from temba.utils import analytics, percentage, datetime_to_str, on_transaction_commit
+from temba.utils import analytics, percentage, datetime_to_str, on_transaction_commit, chunk_list
 from temba.utils.expressions import get_function_listing
 from temba.utils.views import BaseActionForm
 from temba.values.models import Value
@@ -374,7 +374,7 @@ class FlowCRUDL(SmartCRUDL):
     actions = ('list', 'archived', 'copy', 'create', 'delete', 'update', 'simulate', 'export_results',
                'upload_action_recording', 'read', 'editor', 'results', 'run_table', 'json', 'broadcast', 'activity',
                'activity_chart', 'filter', 'campaign', 'completion', 'revisions', 'recent_messages',
-               'upload_media_action')
+               'upload_media_action', 'pdf_export')
 
     model = Flow
 
@@ -520,17 +520,30 @@ class FlowCRUDL(SmartCRUDL):
             return obj
 
     class Delete(ModalMixin, OrgObjPermsMixin, SmartDeleteView):
-        fields = ('pk',)
+        fields = ('id',)
         cancel_url = 'uuid@flows.flow_editor'
-        redirect_url = '@flows.flow_list'
-        default_template = 'smartmin/delete_confirm.html'
-        success_message = _("Your flow has been removed.")
+        success_message = ''
+
+        def get_success_url(self):
+            return reverse("flows.flow_list")
 
         def post(self, request, *args, **kwargs):
-            self.get_object().release()
-            redirect_url = self.get_redirect_url()
+            flow = self.get_object()
+            self.object = flow
 
-            return HttpResponseRedirect(redirect_url)
+            flows = Flow.objects.filter(org=flow.org, flow_dependencies__in=[flow])
+            if flows.count():
+                return HttpResponseRedirect(smart_url(self.cancel_url, flow))
+
+            # do the actual deletion
+            flow.release()
+
+            # we can't just redirect so as to make our modal do the right thing
+            response = self.render_to_response(self.get_context_data(success_url=self.get_success_url(),
+                                                                     success_script=getattr(self, 'success_script', None)))
+            response['Temba-Success'] = self.get_success_url()
+
+            return response
 
     class Copy(OrgObjPermsMixin, SmartUpdateView):
         fields = []
@@ -879,7 +892,13 @@ class FlowCRUDL(SmartCRUDL):
                 dict(name='step', display=six.text_type(_('Sent to'))),
                 dict(name='step.value', display=six.text_type(_('Sent to')))
             ]
-            flow_variables += [dict(name='step.%s' % v['name'], display=v['display']) for v in contact_variables]
+
+            parent_variables = [dict(name='parent.%s' % v['name'], display=v['display']) for v in contact_variables]
+            parent_variables += [dict(name='parent.%s' % v['name'], display=v['display']) for v in flow_variables]
+
+            child_variables = [dict(name='child.%s' % v['name'], display=v['display']) for v in contact_variables]
+            child_variables += [dict(name='child.%s' % v['name'], display=v['display']) for v in flow_variables]
+
             flow_variables.append(dict(name='flow', display=six.text_type(_('All flow variables'))))
 
             flow_id = self.request.GET.get('flow', None)
@@ -895,7 +914,9 @@ class FlowCRUDL(SmartCRUDL):
                     flow_variables.append(dict(name='flow.%s.time' % key, display='%s Time' % rule_set.label))
 
             function_completions = get_function_listing()
-            return JsonResponse(dict(message_completions=contact_variables + date_variables + flow_variables,
+            messages_completions = contact_variables + date_variables + flow_variables
+            messages_completions += parent_variables + child_variables
+            return JsonResponse(dict(message_completions=messages_completions,
                                      function_completions=function_completions))
 
     class Read(OrgObjPermsMixin, SmartReadView):
@@ -985,6 +1006,11 @@ class FlowCRUDL(SmartCRUDL):
                 links.append(dict(title=_("Export"),
                                   href='%s?flow=%s' % (reverse('orgs.org_export'), flow.id)))
 
+            if self.has_org_perm('flows.flow_pdf_export'):
+                links.append(dict(title=_("Export to PDF"),
+                                  href='javascript:;',
+                                  js_class='pdf_export_submit'))
+
             if self.has_org_perm('flows.flow_revisions'):
                 links.append(dict(divider=True)),
                 links.append(dict(title=_("Revision History"),
@@ -992,11 +1018,9 @@ class FlowCRUDL(SmartCRUDL):
                                   href='#'))
 
             if self.has_org_perm('flows.flow_delete'):
-                links.append(dict(divider=True)),
-                links.append(dict(title=_("Delete"),
-                                  delete=True,
-                                  success_url=reverse('flows.flow_list'),
-                                  href=reverse('flows.flow_delete', args=[flow.id])))
+                links.append(dict(title=_('Delete'),
+                                  js_class='delete-flow',
+                                  href="#"))
 
             return links
 
@@ -1028,6 +1052,84 @@ class FlowCRUDL(SmartCRUDL):
         def get_template_names(self):
             return "flows/flow_editor.haml"
 
+        def post(self, request, *args, **kwargs):
+            import os
+            import pdfkit
+
+            self.object = self.get_object()
+
+            protocol = 'http' if settings.DEBUG else 'https'
+
+            csrftoken = '%s' % request.COOKIES.get('csrftoken')
+            sessionid = '%s' % request.session.session_key
+
+            options = {
+                'page-size': 'A4',
+                'margin-top': '0.1in',
+                'margin-right': '0.1in',
+                'margin-bottom': '0.1in',
+                'margin-left': '0.1in',
+                'encoding': "UTF-8",
+                'no-outline': None,
+                'orientation': 'Landscape',
+                'dpi': '300',
+                'zoom': 0.7,
+                'viewport-size': '1920x900',
+                'javascript-delay': 2000,
+                'cookie': [
+                    ('csrftoken', csrftoken),
+                    ('sessionid', sessionid),
+                ],
+                'quiet': ''
+            }
+
+            slug_flow = slugify(self.object.name)
+
+            url = '%s://%s%s' % (protocol, settings.HOSTNAME, reverse('flows.flow_pdf_export', args=[self.object.uuid]))
+            output_dir = '%s/flow_pdf' % settings.MEDIA_ROOT
+            output_path = '%s/%s.pdf' % (output_dir, slug_flow)
+
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+            pdfkit.from_url(url=url, output_path=output_path, options=options)
+
+            with open(output_path, 'r') as pdf:
+                response = HttpResponse(pdf.read(), content_type='application/pdf')
+                response['Content-Disposition'] = 'attachment; filename=%s.pdf' % slug_flow
+                return response
+
+    class PdfExport(Read):
+        def get_context_data(self, *args, **kwargs):
+            context = super(FlowCRUDL.PdfExport, self).get_context_data(*args, **kwargs)
+
+            context['media_url'] = '%s://%s/' % ('http' if settings.DEBUG else 'https', settings.AWS_BUCKET_DOMAIN)
+
+            # are there pending starts?
+            starting = False
+            start = self.object.starts.all().order_by('-created_on')
+            if start.exists() and start[0].status in [FlowStart.STATUS_STARTING, FlowStart.STATUS_PENDING]:  # pragma: needs cover
+                starting = True
+            context['starting'] = starting
+            context['mutable'] = False
+            if self.has_org_perm('flows.flow_update') and not self.request.user.is_superuser:
+                context['mutable'] = True
+
+            context['has_airtime_service'] = bool(self.object.org.is_connected_to_transferto())
+
+            flow = self.get_object()
+            can_start = True
+            if flow.flow_type == Flow.VOICE and not flow.org.supports_ivr():  # pragma: needs cover
+                can_start = False
+            context['can_start'] = can_start
+            return context
+
+        def get_template_names(self):
+            return "flows/flow_pdf_export.haml"
+
+        def get_gear_links(self):
+            return []
+
     class ExportResults(ModalMixin, OrgPermsMixin, SmartFormView):
         class ExportForm(forms.Form):
             flows = forms.ModelMultipleChoiceField(Flow.objects.filter(id__lt=0), required=True,
@@ -1035,6 +1137,12 @@ class FlowCRUDL(SmartCRUDL):
             contact_fields = forms.ModelMultipleChoiceField(ContactField.objects.filter(id__lt=0), required=False,
                                                             help_text=_("Which contact fields, if any, to include "
                                                                         "in the export"))
+
+            extra_urns = forms.MultipleChoiceField(required=False, label=_("Extra URNs"),
+                                                   choices=ContactURN.EXPORT_SCHEME_HEADERS,
+                                                   help_text=_("Extra URNs to include in the export in addition to "
+                                                               "the URN used in the flow"))
+
             responded_only = forms.BooleanField(required=False, label=_("Responded Only"), initial=True,
                                                 help_text=_("Only export results for contacts which responded"))
             include_messages = forms.BooleanField(required=False, label=_("Include Messages"),
@@ -1092,7 +1200,8 @@ class FlowCRUDL(SmartCRUDL):
                                                       contact_fields=form.cleaned_data['contact_fields'],
                                                       include_runs=form.cleaned_data['include_runs'],
                                                       include_msgs=form.cleaned_data['include_messages'],
-                                                      responded_only=form.cleaned_data['responded_only'])
+                                                      responded_only=form.cleaned_data['responded_only'],
+                                                      extra_urns=form.cleaned_data['extra_urns'])
                 on_transaction_commit(lambda: export_flow_results_task.delay(export.pk))
 
                 if not getattr(settings, 'CELERY_ALWAYS_EAGER', False):  # pragma: needs cover
@@ -1364,13 +1473,19 @@ class FlowCRUDL(SmartCRUDL):
                 if runs and runs.first().created_on < timezone.now() - timedelta(hours=24):  # pragma: needs cover
                     analytics.track(user.username, 'temba.flow_simulated')
 
-                ActionLog.objects.filter(run__in=runs).delete()
-                Msg.objects.filter(contact=test_contact).delete()
+                action_log_ids = list(ActionLog.objects.filter(run__in=runs).values_list('id', flat=True))
+                ActionLog.objects.filter(id__in=action_log_ids).delete()
+
+                msg_ids = list(Msg.objects.filter(contact=test_contact).only('id').values_list('id', flat=True))
+
+                for batch in chunk_list(msg_ids, 25):
+                    Msg.objects.filter(id__in=list(batch)).delete()
+
                 IVRCall.objects.filter(contact=test_contact).delete()
                 USSDSession.objects.filter(contact=test_contact).delete()
 
-                runs.delete()
                 steps.delete()
+                FlowRun.objects.filter(contact=test_contact).delete()
 
                 # reset all contact fields values
                 test_contact.values.all().delete()
@@ -1389,8 +1504,7 @@ class FlowCRUDL(SmartCRUDL):
             new_message = json_dict.get('new_message', '')
             media = None
 
-            from temba.settings import TEMBA_HOST, STATIC_URL
-            media_url = 'http://%s%simages' % (TEMBA_HOST, STATIC_URL)
+            media_url = 'http://%s%simages' % (user.get_org().get_brand_domain(), settings.STATIC_URL)
 
             if 'new_photo' in json_dict:  # pragma: needs cover
                 media = '%s/png:%s/simulator_photo.png' % (Msg.MEDIA_IMAGE, media_url)
@@ -1419,7 +1533,7 @@ class FlowCRUDL(SmartCRUDL):
                                                     status=status)
                     else:
                         Msg.create_incoming(None,
-                                            test_contact.get_urn(TEL_SCHEME).urn,
+                                            six.text_type(test_contact.get_urn(TEL_SCHEME)),
                                             new_message,
                                             attachments=[media] if media else None,
                                             org=user.get_org(),
@@ -1434,8 +1548,8 @@ class FlowCRUDL(SmartCRUDL):
 
             if flow.flow_type == Flow.USSD:
                 for msg in messages:
-                    if msg.session.should_end:
-                        msg.session.close()
+                    if msg.connection.should_end:
+                        msg.connection.close()
 
                 # don't show the empty closing message on the simulator
                 messages = messages.exclude(text='', direction='O')

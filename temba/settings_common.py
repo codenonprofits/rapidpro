@@ -44,6 +44,9 @@ EMAIL_USE_TLS = True
 # their own SMTP server.
 FLOW_FROM_EMAIL = 'no-reply@temba.io'
 
+# HTTP Headers using for outgoing requests to other services
+OUTGOING_REQUEST_HEADERS = {'User-agent': 'RapidPro'}
+
 # where recordings and exports are stored
 AWS_STORAGE_BUCKET_NAME = 'dl-temba-io'
 AWS_BUCKET_DOMAIN = AWS_STORAGE_BUCKET_NAME + '.s3.amazonaws.com'
@@ -221,6 +224,7 @@ INSTALLED_APPS = (
     'temba.assets',
     'temba.auth_tweaks',
     'temba.api',
+    'temba.dashboard',
     'temba.public',
     'temba.schedules',
     'temba.orgs',
@@ -236,6 +240,7 @@ INSTALLED_APPS = (
     'temba.ussd',
     'temba.locations',
     'temba.values',
+    'temba.links',
     'temba.airtime',
 )
 
@@ -353,7 +358,10 @@ PERMISSIONS = {
                          'unblock',
                          'unstop',
                          'update_fields',
-                         'update_fields_input'
+                         'update_fields_input',
+                         'invite',
+                         'invite_filter',
+                         'invite_send',
                          ),
 
     'contacts.contactfield': ('api',
@@ -373,9 +381,11 @@ PERMISSIONS = {
                  'smtp_server',
                  'api',
                  'country',
+                 'chatbase',
                  'clear_cache',
                  'create_login',
                  'create_sub_org',
+                 'dashboard',
                  'download',
                  'edit',
                  'edit_sub_org',
@@ -450,6 +460,7 @@ PERMISSIONS = {
                    'simulate',
                    'upload_action_recording',
                    'upload_media_action',
+                   'pdf_export',
                    ),
 
     'flows.ruleset': ('analytics',
@@ -457,6 +468,13 @@ PERMISSIONS = {
                       'map',
                       'results',
                       ),
+
+    'links.link': ('archived',
+                   'read',
+                   'history',
+                   'api',
+                   'export',
+                   ),
 
     'msgs.msg': ('api',
                  'archive',
@@ -572,6 +590,9 @@ GROUP_PERMISSIONS = {
         'contacts.contact_update',
         'contacts.contact_update_fields',
         'contacts.contact_update_fields_input',
+        'contacts.contact_invite',
+        'contacts.contact_invite_filter',
+        'contacts.contact_invite_send',
         'contacts.contactfield.*',
         'contacts.contactgroup.*',
 
@@ -588,7 +609,9 @@ GROUP_PERMISSIONS = {
         'orgs.org_accounts',
         'orgs.org_smtp_server',
         'orgs.org_api',
+        'orgs.org_dashboard',
         'orgs.org_country',
+        'orgs.org_chatbase',
         'orgs.org_create_sub_org',
         'orgs.org_download',
         'orgs.org_edit',
@@ -662,6 +685,14 @@ GROUP_PERMISSIONS = {
         'msgs.msg_sent',
         'msgs.msg_update',
 
+        'links.link.*',
+        'links.link_read',
+        'links.link_archived',
+        'links.link_update',
+        'links.link_history',
+        'links.link_api',
+        'links.link_export',
+
         'triggers.trigger.*',
 
     ),
@@ -699,6 +730,9 @@ GROUP_PERMISSIONS = {
         'contacts.contact_update',
         'contacts.contact_update_fields',
         'contacts.contact_update_fields_input',
+        'contacts.contact_invite',
+        'contacts.contact_invite_filter',
+        'contacts.contact_invite_send',
         'contacts.contactfield.*',
         'contacts.contactgroup.*',
 
@@ -765,6 +799,14 @@ GROUP_PERMISSIONS = {
         'msgs.msg_sent',
         'msgs.msg_update',
 
+        'links.link.*',
+        'links.link_read',
+        'links.link_archived',
+        'links.link_update',
+        'links.link_history',
+        'links.link_api',
+        'links.link_export',
+
         'triggers.trigger.*',
 
     ),
@@ -815,6 +857,7 @@ GROUP_PERMISSIONS = {
         'flows.flow_results',
         'flows.flow_run_table',
         'flows.flow_simulate',
+        'flows.flow_pdf_export',
         'flows.ruleset_analytics',
         'flows.ruleset_results',
         'flows.ruleset_choropleth',
@@ -832,6 +875,12 @@ GROUP_PERMISSIONS = {
 
         'triggers.trigger_archived',
         'triggers.trigger_list',
+
+        'links.link_export',
+        'links.link_archived',
+        'links.link_history',
+        'links.link_list',
+        'links.link_read',
     )
 }
 
@@ -850,9 +899,9 @@ AUTHENTICATION_BACKENDS = (
 ANONYMOUS_USER_NAME = 'AnonymousUser'
 
 # -----------------------------------------------------------------------------------
-# Our test runner is standard but with ability to exclude apps
+# Our test runner includes a mocked HTTP server and the ability to exclude apps
 # -----------------------------------------------------------------------------------
-TEST_RUNNER = 'temba.tests.ExcludeTestRunner'
+TEST_RUNNER = 'temba.tests.TembaTestRunner'
 TEST_EXCLUDE = ('smartmin',)
 
 # -----------------------------------------------------------------------------------
@@ -1063,7 +1112,7 @@ for brand in BRANDING.values():
     COMPRESS_OFFLINE_CONTEXT.append(context)
 
 MAGE_API_URL = 'http://localhost:8026/api/v1'
-MAGE_AUTH_TOKEN = '___MAGE_TOKEN_YOU_PICK__'
+MAGE_AUTH_TOKEN = None  # should be same token as configured on Mage side
 
 # -----------------------------------------------------------------------------------
 # RapidPro configuration settings
@@ -1091,19 +1140,61 @@ SEND_AIRTIME = False
 
 ######
 # DANGER: only turn this on if you know what you are doing!
+#         could cause data to be sent to Chatbase in test environment
+SEND_CHATBASE = False
+
+######
+# DANGER: only turn this on if you know what you are doing!
 #         could cause calls in test environments
 SEND_CALLS = False
 
 MESSAGE_HANDLERS = [
+    'temba.contacts.handlers.InvitationHandler',
     'temba.triggers.handlers.TriggerHandler',
     'temba.flows.handlers.FlowHandler',
     'temba.triggers.handlers.CatchAllHandler'
 ]
 
 CHANNEL_TYPES = [
+    'temba.channels.types.twilio.TwilioType',
+    'temba.channels.types.twilio_messaging_service.TwilioMessagingServiceType',
+    'temba.channels.types.nexmo.NexmoType',
+    'temba.channels.types.africastalking.AfricasTalkingType',
+    'temba.channels.types.blackmyna.BlackmynaType',
+    'temba.channels.types.chikka.ChikkaType',
+    'temba.channels.types.clickatell.ClickatellType',
+    'temba.channels.types.dartmedia.DartMediaType',
+    'temba.channels.types.dmark.DMarkType',
+    'temba.channels.types.external.ExternalType',
     'temba.channels.types.facebook.FacebookType',
+    'temba.channels.types.firebase.FirebaseCloudMessagingType',
+    'temba.channels.types.globe.GlobeType',
+    'temba.channels.types.highconnection.HighConnectionType',
+    'temba.channels.types.hub9.Hub9Type',
+    'temba.channels.types.infobip.InfobipType',
+    'temba.channels.types.jasmin.JasminType',
+    'temba.channels.types.jiochat.JioChatType',
+    'temba.channels.types.junebug.JunebugType',
+    'temba.channels.types.junebug_ussd.JunebugUSSDType',
+    'temba.channels.types.kannel.KannelType',
+    'temba.channels.types.line.LineType',
+    'temba.channels.types.m3tech.M3TechType',
+    'temba.channels.types.macrokiosk.MacrokioskType',
+    'temba.channels.types.mblox.MbloxType',
+    'temba.channels.types.plivo.PlivoType',
+    'temba.channels.types.redrabbit.RedRabbitType',
+    'temba.channels.types.shaqodoon.ShaqodoonType',
+    'temba.channels.types.smscentral.SMSCentralType',
+    'temba.channels.types.start.StartType',
+    'temba.channels.types.telegram.TelegramType',
+    'temba.channels.types.twiml_api.TwimlAPIType',
     'temba.channels.types.twitter.TwitterType',
-    'temba.channels.types.twitter_activity.TwitterActivityType'
+    'temba.channels.types.twitter_activity.TwitterActivityType',
+    'temba.channels.types.viber_public.ViberPublicType',
+    'temba.channels.types.vumi.VumiType',
+    'temba.channels.types.vumi_ussd.VumiUSSDType',
+    'temba.channels.types.yo.YoType',
+    'temba.channels.types.zenvia.ZenviaType',
 ]
 
 # -----------------------------------------------------------------------------------
@@ -1137,6 +1228,7 @@ IP_ADDRESSES = ('172.16.10.10', '162.16.10.20')
 # -----------------------------------------------------------------------------------
 MSG_FIELD_SIZE = 640
 VALUE_FIELD_SIZE = 640
+FLOWRUN_FIELDS_SIZE = 256
 
 # -----------------------------------------------------------------------------------
 # Installs may choose how long to keep the channel logs in hours
@@ -1145,3 +1237,30 @@ VALUE_FIELD_SIZE = 640
 # -----------------------------------------------------------------------------------
 SUCCESS_LOGS_TRIM_TIME = 48
 ALL_LOGS_TRIM_TIME = 24 * 30
+
+# -----------------------------------------------------------------------------------
+# Which channel types will be sent using Courier instead of RapidPro
+# -----------------------------------------------------------------------------------
+COURIER_CHANNELS = set(['DK'])
+
+# -----------------------------------------------------------------------------------
+# Chatbase integration
+# -----------------------------------------------------------------------------------
+CHATBASE_API_URL = 'https://chatbase.com/api/message'
+
+# To allow manage fields to support up to 1000 fields
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 4000
+
+DEFAULT_INVITATION = 'Hi. This is Kathy from Community Connect. Can we occasionally send a short survey to this ' \
+                     'number? Please reply "Y" for yes or "N" for no.'
+
+DEFAULT_MSG_INVITATION_ACCEPTED = 'Thank you for confirming that you agree to receive occasional messages from us.'
+DEFAULT_MSG_INVITATION_REJECTED = 'We will not send you further automated messages. If you change your mind, please ' \
+                                  'reply with "yes" to opt in to receiving occasional automated messages from us.'
+
+INVITATION_ACCEPT_REPLY = 'y'
+INVITATION_REJECT_REPLY = 'n'
+INVITATION_ACCEPTED_GROUP_NAME = 'Opted-In'
+INVITATION_REJECTED_GROUP_NAME = 'Opted-Out'
+
+GOOGLE_SHORTEN_URL_API_KEY = '__YOUR_GOOGLE_SHORTEN_URL_API_KEY__'
